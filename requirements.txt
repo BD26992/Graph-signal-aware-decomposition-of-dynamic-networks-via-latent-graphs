@@ -1,0 +1,9 @@
+numpy
+scipy
+matplotlib
+pandas
+networkx
+scikit-learn
+tensorly
+contextily
+requests

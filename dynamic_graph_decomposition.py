@@ -22,11 +22,14 @@ class DecompositionParams:
     """Hyperparameters for the dynamic graph decomposition solver."""
 
     rank: int
+    alpha: float = 1.0
     gamma: float = 1e-2
     delta: float = 1e-2
+    delta_A: Optional[float] = None
     beta: float = 1e-2
     mu: float = 1e-2
     rho: float = 1e-2
+    eta_graph: float = 0.0
     zeta: float = 1e-3
     lambda_A: float = 1.0
     lambda_C: float = 1.0
@@ -292,36 +295,80 @@ def fit_cpd_als(
     tolerance: float = 1e-6,
     ridge: float = 1e-8,
     random_state: Optional[int] = 0,
+    backend: str = "auto",
 ) -> BaselineResult:
     """Fit a CP decomposition baseline with a NumPy ALS solver.
 
     The MATLAB baseline calls Tensor Toolbox ``cp_als`` on the observed,
-    zero-filled tensor. This wrapper follows that convention when ``mask`` is
-    supplied by decomposing ``mask * adjacency``.
+    zero-filled tensor. ``backend='tensorly'`` follows that convention with
+    TensorLy. ``backend='tensorly_masked'`` is available only for optional
+    ablations that intentionally give the solver the observation mask. With
+    ``backend='auto'``, TensorLy is used on the zero-filled observed tensor when
+    installed; otherwise the code falls back to the local NumPy ALS
+    implementation.
     """
 
     adjacency, mask = _validate_adjacency_and_mask(adjacency, mask)
     observed_tensor = adjacency * mask
-    weights, factors, objective_history = _cp_als_solver(
-        observed_tensor,
-        rank,
-        max_iterations=max_iterations,
-        tolerance=tolerance,
-        ridge=ridge,
-        random_state=random_state,
-    )
-    reconstruction = _cp_reconstruct(weights, factors)
     n_nodes, _, n_times = adjacency.shape
+    backend_used = backend
+    if backend not in {"auto", "numpy", "tensorly", "tensorly_masked"}:
+        raise ValueError(
+            "backend must be 'auto', 'numpy', 'tensorly', or 'tensorly_masked'"
+        )
+    use_masked_tensorly = backend == "tensorly_masked"
+    if backend in {"auto", "tensorly", "tensorly_masked"}:
+        try:
+            reconstruction, factors, objective_history = _tensorly_cpd_solver(
+                adjacency if use_masked_tensorly else observed_tensor,
+                rank,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                random_state=random_state,
+                mask=mask if use_masked_tensorly else None,
+            )
+            backend_used = "tensorly_masked" if use_masked_tensorly else "tensorly"
+        except ImportError:
+            if backend in {"tensorly", "tensorly_masked"}:
+                raise
+            weights, factors_list, objective_history = _cp_als_solver(
+                observed_tensor,
+                rank,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                ridge=ridge,
+                random_state=random_state,
+            )
+            reconstruction = _cp_reconstruct(weights, factors_list)
+            factors = {
+                "weights": weights,
+                "node_left": factors_list[0],
+                "node_right": factors_list[1],
+                "time": factors_list[2],
+            }
+            backend_used = "numpy"
+    else:
+        weights, factors_list, objective_history = _cp_als_solver(
+            observed_tensor,
+            rank,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            ridge=ridge,
+            random_state=random_state,
+        )
+        reconstruction = _cp_reconstruct(weights, factors_list)
+        factors = {
+            "weights": weights,
+            "node_left": factors_list[0],
+            "node_right": factors_list[1],
+            "time": factors_list[2],
+        }
+        backend_used = "numpy"
     return BaselineResult(
-        name="cpd_als",
+        name=f"cpd_{backend_used}",
         reconstruction=reconstruction,
         n_parameters=(2 * n_nodes + n_times + 1) * rank,
-        factors={
-            "weights": weights,
-            "node_left": factors[0],
-            "node_right": factors[1],
-            "time": factors[2],
-        },
+        factors=factors,
         objective_history=objective_history,
     )
 
@@ -368,12 +415,81 @@ def fit_btd_ll1_als(
     )
 
 
+def fit_sica_baseline(
+    adjacency: Array,
+    rank: int,
+    mask: Optional[Array] = None,
+    *,
+    max_iterations: int = 500,
+    tolerance: float = 1e-6,
+    random_state: Optional[int] = 0,
+    backend: str = "auto",
+) -> BaselineResult:
+    """Fit the MATLAB ``ICA``/SICA baseline on the zero-filled tensor.
+
+    The MATLAB code reshapes the observed tensor to ``(N*N, T)``, calls
+    ``fastICA(Z, R, 'kurtosis', 0)``, and reconstructs the centered data from
+    the recovered independent components. This implementation follows the same
+    convention and uses only ``mask * adjacency`` when a mask is supplied. With
+    ``backend='auto'`` it uses scikit-learn's ``FastICA`` when available,
+    otherwise it falls back to a compact local FastICA implementation.
+    """
+
+    adjacency, mask = _validate_adjacency_and_mask(adjacency, mask)
+    if rank <= 0:
+        raise ValueError("rank must be positive")
+
+    observed_matrix = _tensor_to_matrix(adjacency * mask)
+    backend_used = backend
+    if backend not in {"auto", "numpy", "sklearn"}:
+        raise ValueError("backend must be 'auto', 'numpy', or 'sklearn'")
+    if backend in {"auto", "sklearn"}:
+        try:
+            reconstruction_matrix, factors, objective_history = _sklearn_fastica_reconstruct(
+                observed_matrix,
+                rank=rank,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                random_state=random_state,
+            )
+            backend_used = "sklearn"
+        except ImportError:
+            if backend == "sklearn":
+                raise
+            reconstruction_matrix, factors, objective_history = _fastica_reconstruct(
+                observed_matrix,
+                rank=rank,
+                max_iterations=max_iterations,
+                tolerance=tolerance,
+                random_state=random_state,
+            )
+            backend_used = "numpy"
+    else:
+        reconstruction_matrix, factors, objective_history = _fastica_reconstruct(
+            observed_matrix,
+            rank=rank,
+            max_iterations=max_iterations,
+            tolerance=tolerance,
+            random_state=random_state,
+        )
+        backend_used = "numpy"
+    n_nodes, _, n_times = adjacency.shape
+    rank_eff = factors["sources"].shape[0]
+    return BaselineResult(
+        name=f"sica_{backend_used}",
+        reconstruction=_matrix_to_tensor(reconstruction_matrix, n_nodes, n_times),
+        n_parameters=(n_nodes * n_nodes + n_times) * rank_eff,
+        factors=factors,
+        objective_history=objective_history,
+    )
+
+
 def fit_smooth_topology_baseline(
     signal_distances: Array,
     *,
     a: float = 1.0,
     b: float = 1.0,
-    max_iterations: int = 500,
+    max_iterations: int = 1000,
     step_size: Optional[float] = None,
     tolerance: float = 1e-6,
 ) -> BaselineResult:
@@ -433,7 +549,9 @@ def fit_proposed_without_signals(
     """
 
     adjacency, mask = _validate_adjacency_and_mask(adjacency, mask)
-    no_signal_params = DecompositionParams(**{**params.__dict__, "delta": 0.0})
+    no_signal_params = DecompositionParams(
+        **{**params.__dict__, "delta": 0.0, "delta_A": None}
+    )
     if signals is None:
         n_nodes, _, n_times = adjacency.shape
         signals = np.zeros((n_nodes, 1, n_times), dtype=float)
@@ -463,6 +581,7 @@ class DynamicGraphDecomposer:
         mask: Optional[Array] = None,
         initial_latent_graphs: Optional[Array] = None,
         initial_temporal_signatures: Optional[Array] = None,
+        signal_distances: Optional[Array] = None,
     ) -> DecompositionResult:
         """Fit latent graphs and temporal signatures.
 
@@ -501,7 +620,13 @@ class DynamicGraphDecomposer:
             rng, n_times, rank, initial_temporal_signatures
         )
 
-        distances = signal_distance_matrices(signals)
+        if signal_distances is None:
+            distances = signal_distance_matrices(signals)
+        else:
+            distances = np.asarray(signal_distances, dtype=float)
+            expected_shape = (n_times, n_nodes, n_nodes)
+            if distances.shape != expected_shape:
+                raise ValueError(f"signal_distances must have shape {expected_shape}")
         diff = temporal_difference_matrix(n_times)
         objective_history: list[float] = []
 
@@ -564,7 +689,7 @@ class DynamicGraphDecomposer:
         for t in range(n_times):
             reconstruction = np.tensordot(temporal_signatures[t], latent_graphs, axes=(0, 0))
             residual = mask[:, :, t] * (adjacency[:, :, t] - reconstruction)
-            reconstruction_loss += 0.5 * np.sum(residual * residual)
+            reconstruction_loss += 0.5 * p.alpha * np.sum(residual * residual)
             for r in range(rank):
                 signal_penalty += (
                     0.5
@@ -582,7 +707,16 @@ class DynamicGraphDecomposer:
 
         smoothness = p.mu * np.sum((diff @ temporal_signatures) ** 2)
         ridge = 0.5 * p.rho * np.sum(temporal_signatures * temporal_signatures)
-        return float(reconstruction_loss + sparsity + signal_penalty + overlap + smoothness + ridge)
+        graph_ridge = 0.5 * p.eta_graph * np.sum(latent_graphs * latent_graphs)
+        return float(
+            reconstruction_loss
+            + sparsity
+            + signal_penalty
+            + overlap
+            + smoothness
+            + ridge
+            + graph_ridge
+        )
 
     def _update_latent_graph(
         self,
@@ -615,7 +749,11 @@ class DynamicGraphDecomposer:
             weighted_mask = np.zeros((n_nodes, n_nodes), dtype=float)
             for t in range(n_times):
                 weighted_mask += temporal_signatures[t, r] ** 2 * mask[:, :, t]
-            curvature = np.max(weighted_mask) + p.lambda_A * np.linalg.norm(phi_r, ord=2) ** 2
+            curvature = (
+                p.alpha * np.max(weighted_mask)
+                + p.lambda_A * np.linalg.norm(phi_r, ord=2) ** 2
+                + p.eta_graph
+            )
             eta = 1.0 / (curvature + 1e-12)
 
         for _ in range(p.inner_iterations_A):
@@ -624,7 +762,7 @@ class DynamicGraphDecomposer:
             signal_gradient = np.zeros((n_nodes, n_nodes), dtype=float)
             for t in range(n_times):
                 residual_t = reconstruction[t] - adjacency[:, :, t]
-                data_gradient += (
+                data_gradient += p.alpha * (
                     temporal_signatures[t, r] * mask[:, :, t] * residual_t
                 )
                 signal_gradient += temporal_signatures[t, r] * distances[t]
@@ -637,8 +775,9 @@ class DynamicGraphDecomposer:
             gradient = (
                 data_gradient
                 + p.gamma * np.ones((n_nodes, n_nodes), dtype=float)
-                + 0.5 * p.delta * signal_gradient
+                + 0.5 * (p.delta_A if p.delta_A is not None else p.delta) * signal_gradient
                 + 2.0 * p.beta * overlap_gradient
+                + p.eta_graph * graph
             )
             residual_constraint = graph @ phi_r + gamma_r - slack
             augmented_gradient = (
@@ -678,7 +817,7 @@ class DynamicGraphDecomposer:
 
         eta = p.eta_C
         if eta is None:
-            data_curvature = np.linalg.norm(latent_matrix, ord=2) ** 2
+            data_curvature = p.alpha * np.linalg.norm(latent_matrix, ord=2) ** 2
             smooth_curvature = 2.0 * p.mu * np.linalg.norm(diff, ord=2) ** 2 if diff.size else 0.0
             degree_curvature = p.lambda_C * np.linalg.norm(degrees, ord=2) ** 2
             curvature = data_curvature + smooth_curvature + p.rho + degree_curvature
@@ -687,7 +826,7 @@ class DynamicGraphDecomposer:
         for _ in range(p.inner_iterations_C):
             residual = mask_matrix * (latent_matrix @ temporal_signatures.T - adjacency_matrix)
             gradient = (
-                residual.T @ latent_matrix
+                p.alpha * (residual.T @ latent_matrix)
                 + 0.5 * p.delta * distance_matrix @ latent_matrix
                 + 2.0 * p.mu * diff.T @ diff @ temporal_signatures
                 + p.rho * temporal_signatures
@@ -892,6 +1031,47 @@ def _cp_reconstruct(weights: Array, factors: list[Array]) -> Array:
     )
 
 
+def _tensorly_cpd_solver(
+    tensor: Array,
+    rank: int,
+    *,
+    max_iterations: int,
+    tolerance: float,
+    random_state: Optional[int],
+    mask: Optional[Array] = None,
+) -> tuple[Array, dict[str, Array], list[float]]:
+    try:
+        import tensorly as tl
+        from tensorly.cp_tensor import cp_to_tensor
+        from tensorly.decomposition import parafac
+    except ImportError as exc:
+        raise ImportError(
+            "TensorLy is required for backend='tensorly'. Install tensorly."
+        ) from exc
+
+    tl.set_backend("numpy")
+    cp_tensor = parafac(
+        tensor,
+        rank=rank,
+        n_iter_max=max_iterations,
+        init="random",
+        tol=tolerance,
+        random_state=random_state,
+        normalize_factors=False,
+        verbose=False,
+        mask=mask,
+    )
+    reconstruction = np.asarray(cp_to_tensor(cp_tensor), dtype=float)
+    weights, factors = cp_tensor
+    objective = float(np.sum((tensor - reconstruction) ** 2))
+    return reconstruction, {
+        "weights": np.asarray(weights, dtype=float),
+        "node_left": np.asarray(factors[0], dtype=float),
+        "node_right": np.asarray(factors[1], dtype=float),
+        "time": np.asarray(factors[2], dtype=float),
+    }, [objective]
+
+
 def _btd_ll1_als_solver(
     tensor: Array,
     *,
@@ -991,6 +1171,123 @@ def _btd_ll1_reconstruct(
     return reconstruction
 
 
+def _fastica_reconstruct(
+    matrix: Array,
+    *,
+    rank: int,
+    max_iterations: int,
+    tolerance: float,
+    random_state: Optional[int],
+) -> tuple[Array, dict[str, Array], list[float]]:
+    matrix = np.asarray(matrix, dtype=float)
+    if matrix.ndim != 2:
+        raise ValueError("matrix must be two-dimensional")
+
+    n_features, n_samples = matrix.shape
+    mean = np.mean(matrix, axis=1, keepdims=True)
+    centered = matrix - mean
+    u, s, vt = np.linalg.svd(centered, full_matrices=False)
+    rank_eff = min(rank, int(np.sum(s > 1e-12)), n_samples)
+    if rank_eff == 0:
+        reconstruction = np.repeat(mean, n_samples, axis=1)
+        return reconstruction, {
+            "mixing": np.zeros((n_features, 0), dtype=float),
+            "sources": np.zeros((0, n_samples), dtype=float),
+            "mean": mean,
+            "whitening": np.zeros((0, n_features), dtype=float),
+            "unmixing": np.zeros((0, 0), dtype=float),
+        }, [float(np.sum((matrix - reconstruction) ** 2))]
+
+    u_r = u[:, :rank_eff]
+    s_r = s[:rank_eff]
+    vt_r = vt[:rank_eff]
+    whitening = (np.sqrt(n_samples) / s_r)[:, None] * u_r.T
+    whitened = np.sqrt(n_samples) * vt_r
+
+    rng = np.random.default_rng(random_state)
+    unmixing = rng.standard_normal((rank_eff, rank_eff))
+    unmixing = _symmetric_decorrelation(unmixing)
+    objective_history: list[float] = []
+
+    for _ in range(max_iterations):
+        projected = unmixing @ whitened
+        updated = (projected**3 @ whitened.T) / n_samples - 3.0 * unmixing
+        updated = _symmetric_decorrelation(updated)
+        alignment = np.abs(np.diag(updated @ unmixing.T))
+        objective_history.append(float(np.max(np.abs(1.0 - alignment))))
+        unmixing = updated
+        if objective_history[-1] < tolerance:
+            break
+
+    sources = unmixing @ whitened
+    source_gram = sources @ sources.T
+    mixing = centered @ sources.T @ np.linalg.pinv(source_gram)
+    reconstruction = mixing @ sources + mean
+    objective_history.append(float(np.sum((matrix - reconstruction) ** 2)))
+    return reconstruction, {
+        "mixing": mixing,
+        "sources": sources,
+        "mean": mean,
+        "whitening": whitening,
+        "unmixing": unmixing,
+    }, objective_history
+
+
+def _sklearn_fastica_reconstruct(
+    matrix: Array,
+    *,
+    rank: int,
+    max_iterations: int,
+    tolerance: float,
+    random_state: Optional[int],
+) -> tuple[Array, dict[str, Array], list[float]]:
+    try:
+        from sklearn.decomposition import FastICA
+    except ImportError as exc:
+        raise ImportError(
+            "scikit-learn is required for backend='sklearn'. Install scikit-learn."
+        ) from exc
+
+    matrix = np.asarray(matrix, dtype=float)
+    n_features, n_samples = matrix.shape
+    rank_eff = min(rank, n_features, n_samples)
+    if rank_eff <= 0:
+        reconstruction = np.zeros_like(matrix)
+        return reconstruction, {
+            "mixing": np.zeros((n_features, 0), dtype=float),
+            "sources": np.zeros((0, n_samples), dtype=float),
+            "mean": np.zeros((n_features, 1), dtype=float),
+        }, [float(np.sum((matrix - reconstruction) ** 2))]
+
+    ica = FastICA(
+        n_components=rank_eff,
+        algorithm="parallel",
+        whiten="unit-variance",
+        fun="cube",
+        max_iter=max_iterations,
+        tol=tolerance,
+        random_state=random_state,
+    )
+    samples_by_features = matrix.T
+    sources_samples = ica.fit_transform(samples_by_features)
+    reconstruction = np.asarray(ica.inverse_transform(sources_samples).T, dtype=float)
+    sources = np.asarray(sources_samples.T, dtype=float)
+    objective = float(np.sum((matrix - reconstruction) ** 2))
+    return reconstruction, {
+        "mixing": np.asarray(ica.mixing_, dtype=float),
+        "sources": sources,
+        "mean": np.asarray(ica.mean_, dtype=float).reshape(-1, 1),
+        "components": np.asarray(ica.components_, dtype=float),
+    }, [objective]
+
+
+def _symmetric_decorrelation(matrix: Array) -> Array:
+    gram = matrix @ matrix.T
+    eigvals, eigvecs = np.linalg.eigh(0.5 * (gram + gram.T))
+    eigvals = np.maximum(eigvals, 1e-12)
+    return (eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T) @ matrix
+
+
 def _learn_graph_log_degrees(
     distances: Array,
     *,
@@ -1000,32 +1297,71 @@ def _learn_graph_log_degrees(
     step_size: Optional[float],
     tolerance: float,
 ) -> tuple[Array, list[float]]:
+    """GSPBox-style ``gsp_learn_graph_log_degrees`` solver.
+
+    This follows the forward-backward-forward primal-dual updates used by the
+    MATLAB GSPBox routine. The optimization variable is the upper-triangular
+    edge-weight vector ``w`` and ``K`` maps edge weights to node degrees.
+    """
+
     distances = np.asarray(distances, dtype=float)
     if distances.ndim != 2 or distances.shape[0] != distances.shape[1]:
         raise ValueError("distances must be a square matrix")
     n_nodes = distances.shape[0]
     distances = 0.5 * (distances + distances.T)
     np.fill_diagonal(distances, 0.0)
-
-    graph = np.exp(-distances / max(np.mean(distances[distances > 0.0]), 1e-12))
-    np.fill_diagonal(graph, 0.0)
-    graph = project_latent_graph(graph)
+    rows, cols = np.triu_indices(n_nodes, k=1)
+    z = distances[rows, cols].astype(float)
+    w = np.zeros_like(z)
+    dual = _edge_weights_to_degrees(w, rows, cols, n_nodes)
+    norm_k = np.sqrt(2.0 * (n_nodes - 1))
+    h_beta = 2.0 * b
+    mu = h_beta + norm_k
+    epsilon = 1.0 / (2.0 * (1.0 + mu))
     if step_size is None:
-        step_size = 1.0 / (b + 2.0 * a * n_nodes + np.max(distances) + 1e-12)
-
+        step_size = 0.5
+    gamma = epsilon + step_size * ((1.0 - epsilon) / mu - epsilon)
+    gamma = float(np.clip(gamma, np.finfo(float).eps, np.inf))
+    max_weight = np.inf
     objective_history: list[float] = []
     for _ in range(max_iterations):
-        degrees = np.sum(graph, axis=1)
-        degrees = np.maximum(degrees, 1e-12)
-        gradient = distances + b * graph
-        gradient -= a * (1.0 / degrees[:, None] + 1.0 / degrees[None, :])
-        np.fill_diagonal(gradient, 0.0)
-        graph = project_latent_graph(graph - step_size * gradient)
+        y_primal = w - gamma * (2.0 * b * w + _degree_dual_to_edges(dual, rows, cols))
+        y_dual = dual + gamma * _edge_weights_to_degrees(w, rows, cols, n_nodes)
+
+        p_primal = np.minimum(max_weight, np.maximum(0.0, y_primal - 2.0 * gamma * z))
+        p_dual = y_dual - gamma * a * _prox_sum_log(
+            y_dual / (gamma * a),
+            1.0 / (gamma * a),
+        )
+
+        q_primal = p_primal - gamma * (
+            2.0 * b * p_primal + _degree_dual_to_edges(p_dual, rows, cols)
+        )
+        q_dual = p_dual + gamma * _edge_weights_to_degrees(
+            p_primal,
+            rows,
+            cols,
+            n_nodes,
+        )
+
+        rel_primal = np.linalg.norm(-y_primal + q_primal) / max(
+            np.linalg.norm(w),
+            np.finfo(float).eps,
+        )
+        rel_dual = np.linalg.norm(-y_dual + q_dual) / max(
+            np.linalg.norm(dual),
+            np.finfo(float).eps,
+        )
+
+        w = w - y_primal + q_primal
+        dual = dual - y_dual + q_dual
+        graph = _edge_vector_to_symmetric_matrix(w, rows, cols, n_nodes)
         objective = _smooth_topology_objective(graph, distances, a, b)
         objective_history.append(objective)
-        if _has_converged(objective_history, tolerance):
+        if rel_primal < tolerance and rel_dual < tolerance:
             break
 
+    graph = _edge_vector_to_symmetric_matrix(w, rows, cols, n_nodes)
     return graph, objective_history
 
 
@@ -1036,3 +1372,35 @@ def _smooth_topology_objective(graph: Array, distances: Array, a: float, b: floa
         - a * np.sum(np.log(degrees))
         + 0.5 * b * np.sum(graph * graph)
     )
+
+
+def _prox_sum_log(values: Array, gamma: float) -> Array:
+    return 0.5 * (values + np.sqrt(values * values + 4.0 * gamma))
+
+
+def _edge_weights_to_degrees(
+    weights: Array,
+    rows: Array,
+    cols: Array,
+    n_nodes: int,
+) -> Array:
+    degrees = np.zeros(n_nodes, dtype=float)
+    np.add.at(degrees, rows, weights)
+    np.add.at(degrees, cols, weights)
+    return degrees
+
+
+def _degree_dual_to_edges(dual: Array, rows: Array, cols: Array) -> Array:
+    return dual[rows] + dual[cols]
+
+
+def _edge_vector_to_symmetric_matrix(
+    weights: Array,
+    rows: Array,
+    cols: Array,
+    n_nodes: int,
+) -> Array:
+    graph = np.zeros((n_nodes, n_nodes), dtype=float)
+    graph[rows, cols] = weights
+    graph[cols, rows] = weights
+    return graph

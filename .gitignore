@@ -1,0 +1,27 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local caches
+.matplotlib/
+.mplconfig/
+tmp/
+
+# Generated outputs
+results/
+plots/
+*.svg
+
+# Additional local/private datasets and downloaded artifacts.
+# The public real-data files live under data/raw and data/processed.
+data/*
+!data/README.md
+!data/raw/
+!data/raw/**
+!data/processed/
+!data/processed/**
+transferability_code_extracted/
+
+# Virtual environments
+.venv/
+venv/

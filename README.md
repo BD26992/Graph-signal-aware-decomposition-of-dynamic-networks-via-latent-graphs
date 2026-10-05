@@ -1,0 +1,200 @@
+# Dynamic Graph Decomposition
+
+Python/NumPy implementation of dynamic graph decomposition with graph-signal
+regularization, missing-link masks, and the baselines used in the accompanying
+experiments.
+
+The model approximates a dynamic adjacency tensor as
+
+```text
+A[:, :, t] ~= sum_r C[t, r] A_r
+```
+
+where each latent graph `A_r` is nonnegative, symmetric, and zero-diagonal,
+and the temporal signatures `C` are nonnegative.
+
+## Installation
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+## Run a Small Example
+
+```bash
+python3 example.py
+```
+
+## Basic Usage
+
+```python
+from dynamic_graph_decomposition import DecompositionParams, DynamicGraphDecomposer
+
+params = DecompositionParams(rank=3, outer_iterations=50)
+solver = DynamicGraphDecomposer(params)
+
+result = solver.fit(
+    adjacency=A,  # shape (N, N, T)
+    mask=M,       # shape (N, N, T), optional
+    signals=X,    # shape (N, Q, T)
+)
+
+latent_graphs = result.latent_graphs          # shape (R, N, N)
+temporal_signatures = result.temporal_signatures  # shape (T, R)
+reconstruction = solver.reconstruct(latent_graphs, temporal_signatures)
+```
+
+## Notes
+
+- Missing or unobserved edges are handled by the mask throughout the gradients.
+- If `eta_A` or `eta_C` are left as `None`, conservative step sizes are estimated
+  from the current curvature terms.
+- The degree lower-bound constraints are enforced by the ADMM-style slack and
+  dual updates described in the PDF.
+
+## Public Experiment Entrypoints
+
+The curated scripts below are the intended entrypoints for reproducing or
+checking the paper experiments. Historical debugging/probing scripts are kept in
+`scripts/diagnostics/` and supplementary exploratory experiments are kept in
+`scripts/supplementary/` only for provenance.
+
+```bash
+python3 experiments/run_swdyn_repeated.py --help
+python3 experiments/run_real_repeated.py --help
+python3 experiments/run_convergence.py --help
+python3 experiments/run_rank_sweep.py --help
+python3 experiments/run_component_isolation.py --help
+python3 experiments/run_graph_metrics.py --help
+```
+
+`run_swdyn_repeated.py` and `run_real_repeated.py` perform repeated
+train/validation/test missing-link trials and report mean/std curves from the
+saved detail CSVs. The UNC baseline can be run in either convention:
+
+```bash
+--unc-mode zero_filled  # fit the zero-filled observed tensor
+--unc-mode masked       # pass the observation mask to UNC
+--unc-mode both         # report UNC and UNC_masked
+```
+
+The graph-metric experiment defaults to 10 repetitions:
+
+```bash
+python3 experiments/run_graph_metrics.py
+```
+
+This computes clustering coefficient, modularity, assortativity, and pairwise
+Jaccard indices for top-150 unweighted component supports.
+
+## Reproduce Main Experiments
+
+The commands below write CSV files under `results/csv/`. The default grids use
+the train/validation/test missing-link setup used for the reported experiments:
+hyperparameters are selected on validation entries and the final scores are
+computed on held-out entries.
+
+```bash
+# Synthetic SwDyn, all baselines.
+python3 experiments/run_swdyn_repeated.py \
+  --observed 10 20 30 40 50 60 70 80 90 \
+  --repeats 5 \
+  --outer-iterations 15 \
+  --unc-mode both \
+  --detail-output results/csv/swdyn_detail.csv \
+  --summary-output results/csv/swdyn_summary.csv \
+  --tuning-output results/csv/swdyn_tuning.csv
+
+# Real datasets. Replace only --data/--dataset-name/outputs for each dataset.
+python3 experiments/run_real_repeated.py \
+  --data data/processed/surface_8_data.mat \
+  --dataset-name SeaSurf \
+  --rank 3 \
+  --observed 10 20 30 40 50 60 70 80 90 \
+  --repeats 5 \
+  --outer-iterations 15 \
+  --unc-mode both \
+  --detail-output results/csv/seasurf_detail.csv \
+  --summary-output results/csv/seasurf_summary.csv \
+  --tuning-output results/csv/seasurf_tuning.csv
+
+python3 experiments/run_real_repeated.py \
+  --data data/processed/UStemp_15_data.mat \
+  --dataset-name USTemp \
+  --rank 3 \
+  --observed 10 20 30 40 50 60 70 80 90 \
+  --repeats 5 \
+  --outer-iterations 15 \
+  --unc-mode both \
+  --detail-output results/csv/ustemp_detail.csv \
+  --summary-output results/csv/ustemp_summary.csv \
+  --tuning-output results/csv/ustemp_tuning.csv
+
+python3 experiments/run_real_repeated.py \
+  --data data/processed/contact_50_data.mat \
+  --dataset-name Contact \
+  --rank 3 \
+  --observed 10 20 30 40 50 60 70 80 90 \
+  --repeats 5 \
+  --outer-iterations 15 \
+  --unc-mode both \
+  --detail-output results/csv/contact_detail.csv \
+  --summary-output results/csv/contact_summary.csv \
+  --tuning-output results/csv/contact_tuning.csv
+```
+
+Additional paper figures are generated from the other public entrypoints:
+
+```bash
+python3 experiments/run_convergence.py --help
+python3 experiments/run_rank_sweep.py --help
+python3 experiments/run_component_isolation.py --help
+python3 experiments/run_graph_metrics.py --help
+```
+
+## Data
+
+Synthetic SwDyn data are generated by the code. The real datasets used in the
+experiments are included under `data/`:
+
+- `data/raw/` stores the raw MATLAB files used for preprocessing.
+- `data/processed/` stores the processed tensors consumed by the experiment
+  runners.
+
+For example:
+
+```bash
+python3 experiments/run_real_repeated.py \
+  --data data/processed/surface_8_data.mat \
+  --dataset-name SeaSurf \
+  --rank 3 \
+  --detail-output results/csv/seasurf_detail.csv \
+  --summary-output results/csv/seasurf_summary.csv \
+  --tuning-output results/csv/seasurf_tuning.csv
+```
+
+SeaSurf can be rebuilt with a different number of temporal slices:
+
+```bash
+python3 preprocessing/build_seasurf.py \
+  --raw data/raw/surface/seasurfacetemperature.mat \
+  --n-times 16 \
+  --output data/processed/surface_16_data.mat
+```
+
+Generated outputs under `results/`, extra local datasets under `data/`, and
+local cache directories are ignored by Git.
+
+## Repository Layout
+
+```text
+dynamic_graph_decomposition.py   Core DGD solver and decomposition utilities
+baselines.py                     Baseline methods
+experiments/                     Public experiment entrypoints
+plotting/                        Figure-formatting scripts
+scripts/diagnostics/             Historical probes and reruns
+scripts/supplementary/           Exploratory side experiments
+preprocessing/                   Dataset builders
+results/                         Generated outputs, ignored by Git
+data/                            Raw and processed experiment data
+```
